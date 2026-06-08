@@ -5,12 +5,11 @@ import React, { startTransition, useCallback, useEffect, useMemo, useRef, useSta
 import { useTranslations } from 'next-intl';
 import { Check, Crown } from 'lucide-react';
 import { apiClient, getApiErrorMessage } from '@/lib/api';
-import { formatPriceByCountry, isKoreanCountry } from '@/lib/currency';
+import { formatPriceByCountry } from '@/lib/currency';
 import { useAppDispatch, useAppSelector } from '@/lib/hooks';
 import {
   cancelPlanSubscription,
   fetchBillingPageData,
-  pauseSubscription,
   resumeAutoRenew,
   resumeSubscription,
   upgradeSubscription,
@@ -95,7 +94,7 @@ const getPaymentErrorMessage = (error: unknown, fallback: string) => {
 
 export default function BillingPage() {
   const dispatch = useAppDispatch();
-  const { plans, loading, error, savingPlan, cancelLoading, pauseLoading, resumeLoading, resumeAutoRenewLoading, upgradeLoading, countryCode } = useAppSelector((state) => state.account.billing);
+  const { plans, loading, error, savingPlan, cancelLoading, resumeLoading, resumeAutoRenewLoading, upgradeLoading, countryCode } = useAppSelector((state) => state.account.billing);
   const snapshot = useAppSelector((state) => state.account.subscription.data) as BillingSnapshot | null;
   const t = useTranslations('UserPanel.billing');
   const [cycle, setCycle] = useState<BillingCycle>('monthly');
@@ -111,8 +110,6 @@ export default function BillingPage() {
   const paddlePromiseRef = useRef<Promise<Paddle> | null>(null);
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const popupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const isKorean = isKoreanCountry(countryCode);
 
   const formatPrice = (usd: number) => {
     return formatPriceByCountry(usd, countryCode);
@@ -133,7 +130,7 @@ export default function BillingPage() {
 
   useEffect(() => {
     dispatch(fetchBillingPageData());
-  }, [dispatch]);
+  }, [dispatch, t]);
 
   useEffect(() => {
     let active = true;
@@ -198,7 +195,7 @@ export default function BillingPage() {
     if (event.name === 'checkout.closed') {
       setCheckoutPlan(null);
     }
-  }, [dispatch]);
+  }, [dispatch, t]);
 
   const currentSubscription = snapshot?.subscription ?? null;
   const hasEffectivePlan =
@@ -272,7 +269,7 @@ export default function BillingPage() {
     const limit = snapshot.usage.imageUploadLimit;
     if (!limit) return `${used} uploads this month (unlimited plan)`;
     return `${used}/${limit} uploads used this month`;
-  }, [snapshot, hasEffectivePlan]);
+  }, [snapshot]);
 
   const searchUsage = useMemo(() => {
     if (!snapshot) {
@@ -366,18 +363,9 @@ export default function BillingPage() {
   const cancelSubscription = async () => {
     try {
       await dispatch(cancelPlanSubscription()).unwrap();
-      showPopup('success', t('subscriptionCancelled'));
+      showPopup('success', t('autoRenewDisabled'));
     } catch (err) {
       showPopup('error', getPaymentErrorMessage(err, 'Unable to cancel subscription.'));
-    }
-  };
-
-  const handlePause = async () => {
-    try {
-      await dispatch(pauseSubscription()).unwrap();
-      showPopup('success', t('subscriptionPausedSuccess'));
-    } catch (err) {
-      showPopup('error', getPaymentErrorMessage(err, 'Unable to pause subscription.'));
     }
   };
 
@@ -437,6 +425,24 @@ export default function BillingPage() {
       return `${currency || 'USD'} ${amount}`;
     }
   };
+
+  const handleAutoRenewToggle = async () => {
+    if (isCancelScheduled) {
+      await handleResumeAutoRenew();
+      return;
+    }
+
+    await cancelSubscription();
+  };
+
+  const autoRenewButtonLoading = cancelLoading || resumeAutoRenewLoading;
+  const autoRenewButtonLabel = autoRenewButtonLoading
+    ? isCancelScheduled
+      ? t('resuming')
+      : t('turningOffAutoRenew')
+    : isCancelScheduled
+      ? t('resumeAutoRenew')
+      : t('turnOffAutoRenew');
 
   // Cleanup polling on unmount
   useEffect(() => () => { if (pollTimerRef.current) clearTimeout(pollTimerRef.current); }, []);
@@ -535,7 +541,7 @@ export default function BillingPage() {
 
       {/* Scheduled cancellation notice */}
       {isCancelScheduled && cancelEffectiveDate && (
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
           <span>
             <span className="mr-2 inline-block rounded-full bg-amber-600 px-2 py-0.5 text-xs font-semibold uppercase text-white">{t('autoRenewOffBadge')}</span>
             {t('cancellationScheduled', { date: cancelEffectiveDate.toLocaleDateString() })}
@@ -543,14 +549,6 @@ export default function BillingPage() {
               <> {t('daysRemaining', { days: scheduledCancelDaysLeft, unit: scheduledCancelDaysLeft !== 1 ? t('days') : t('day') })}</>
             )}
           </span>
-          <button
-            type="button"
-            onClick={handleResumeAutoRenew}
-            disabled={resumeAutoRenewLoading}
-            className="rounded-md bg-amber-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-800 disabled:opacity-60"
-          >
-            {resumeAutoRenewLoading ? t('resuming') : t('resumeAutoRenew')}
-          </button>
         </div>
       )}
 
@@ -679,27 +677,21 @@ export default function BillingPage() {
               </button>
             </div>
 
-            {/* Cancel — only for active + paddle-managed */}
+            {/* Auto-renew control — only for active + paddle-managed */}
             {snapshot?.subscription?.status === 'active' && snapshot.subscription.paddleManaged && (
-              <>
-                <button
-                  type="button"
-                  onClick={handlePause}
-                  disabled={pauseLoading || isCancelScheduled}
-                  className="rounded-lg border border-gray-300 px-3 py-2 text-xs font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-60"
-                >
-                  {pauseLoading ? t('pausing') : isCancelScheduled ? t('pauseUnavailable') : t('pauseAtPeriodEnd')}
-                </button>
-
-                <button
-                  type="button"
-                  onClick={cancelSubscription}
-                  disabled={cancelLoading || isCancelScheduled}
-                  className="rounded-lg border border-red-200 px-3 py-2 text-xs font-medium text-red-600 hover:bg-red-50 disabled:opacity-60"
-                >
-                  {cancelLoading ? t('cancelling') : isCancelScheduled ? t('cancellationScheduledBtn') : t('cancelAtPeriodEnd')}
-                </button>
-              </>
+              <button
+                type="button"
+                onClick={handleAutoRenewToggle}
+                disabled={autoRenewButtonLoading}
+                className={[
+                  'rounded-lg px-3 py-2 text-xs font-medium disabled:opacity-60',
+                  isCancelScheduled
+                    ? 'border border-amber-300 text-amber-700 hover:bg-amber-50'
+                    : 'border border-red-200 text-red-600 hover:bg-red-50',
+                ].join(' ')}
+              >
+                {autoRenewButtonLabel}
+              </button>
             )}
           </div>
         </div>
