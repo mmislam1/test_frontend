@@ -4,6 +4,7 @@ import { detectCountryCodeByIp } from '../../currency';
 
 export type PlanTier = 'starter' | 'pro' | 'premium';
 export type BillingCycle = 'monthly' | 'annual';
+export type SubscriptionStatus = 'active' | 'trialing' | 'past_due' | 'paused' | 'cancelled' | 'expired' | 'pending';
 export type SummaryFrequency = 'instant' | 'daily' | 'weekly';
 export type NotificationFilter = 'all' | 'unread';
 export type NotificationScope = 'topbar' | 'settings';
@@ -23,7 +24,7 @@ export interface BillingPlan {
 export interface BillingSnapshot {
   subscription: {
     id?: string;
-    status: 'active' | 'trialing' | 'past_due' | 'paused' | 'cancelled' | 'expired' | 'pending';
+    status: SubscriptionStatus | null;
     hasAccess?: boolean;
     billingCycle: BillingCycle;
     grantSource?: 'paid' | 'trial' | 'referral';
@@ -37,6 +38,11 @@ export interface BillingSnapshot {
     currentPeriodEnd?: string;
     nextBillingDate?: string;
     cancelDate?: string;
+    autoRenewEnabled?: boolean;
+    nextPlan?: BillingPlan | null;
+    nextBillingCycle?: BillingCycle | null;
+    hasScheduledPlanChange?: boolean;
+    planChangeEffectiveAt?: string | null;
     paddleStatus?: string;
   } | null;
   plan: BillingPlan;
@@ -48,6 +54,15 @@ export interface BillingSnapshot {
     alertLimit: number;
     pdfEnabled: boolean;
   };
+}
+
+interface BillingSubscriptionChangeResponse {
+  success: true;
+  syncedLocally: boolean;
+  changeTiming: 'immediate' | 'next_billing_period' | 'none';
+  effectiveAt?: string | null;
+  message: string;
+  paddleSubscriptionId?: string;
 }
 
 export interface ReferralStatus {
@@ -240,13 +255,21 @@ export const resumeAutoRenew = createAsyncThunk<
 });
 
 export const upgradeSubscription = createAsyncThunk<
-  { plans: BillingPlan[]; snapshot: BillingSnapshot | null; countryCode: string },
+  {
+    billingData: { plans: BillingPlan[]; snapshot: BillingSnapshot | null; countryCode: string };
+    changeSummary: BillingSubscriptionChangeResponse;
+  },
   { tier: PlanTier; billingCycle?: BillingCycle },
   { rejectValue: string }
 >('account/upgradeSubscription', async (payload, { dispatch, rejectWithValue }) => {
   try {
-    await apiClient.patch('/billing/subscription', payload);
-    return await dispatch(fetchBillingPageData()).unwrap();
+    const response = await apiClient.patch('/billing/subscription', payload);
+    const billingData = await dispatch(fetchBillingPageData()).unwrap();
+
+    return {
+      billingData,
+      changeSummary: response.data as BillingSubscriptionChangeResponse,
+    };
   } catch (error) {
     return rejectWithValue(getApiErrorMessage(error, 'Failed to change subscription.'));
   }
@@ -658,9 +681,9 @@ const accountSlice = createSlice({
       })
       .addCase(upgradeSubscription.fulfilled, (state, action) => {
         state.billing.upgradeLoading = null;
-        state.billing.plans = action.payload.plans;
-        state.billing.countryCode = action.payload.countryCode;
-        state.subscription.data = action.payload.snapshot;
+        state.billing.plans = action.payload.billingData.plans;
+        state.billing.countryCode = action.payload.billingData.countryCode;
+        state.subscription.data = action.payload.billingData.snapshot;
       })
       .addCase(upgradeSubscription.rejected, (state, action) => {
         state.billing.upgradeLoading = null;

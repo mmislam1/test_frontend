@@ -17,6 +17,7 @@ import {
 
 type PlanTier = 'starter' | 'pro' | 'premium';
 type BillingCycle = 'monthly' | 'annual';
+type SubscriptionStatus = 'active' | 'trialing' | 'past_due' | 'paused' | 'cancelled' | 'expired' | 'pending';
 
 interface Plan {
   tier: PlanTier;
@@ -32,7 +33,7 @@ interface Plan {
 interface BillingSnapshot {
   subscription: {
     id?: string;
-    status: 'active' | 'trialing' | 'past_due' | 'paused' | 'cancelled' | 'expired' | 'pending';
+    status: SubscriptionStatus | null;
     hasAccess?: boolean;
     billingCycle: BillingCycle;
     grantSource?: 'paid' | 'trial' | 'referral';
@@ -46,6 +47,11 @@ interface BillingSnapshot {
     currentPeriodEnd?: string;
     nextBillingDate?: string;
     cancelDate?: string;
+    autoRenewEnabled?: boolean;
+    nextPlan?: Plan | null;
+    nextBillingCycle?: BillingCycle | null;
+    hasScheduledPlanChange?: boolean;
+    planChangeEffectiveAt?: string | null;
     paddleStatus?: string;
   } | null;
   plan: Plan;
@@ -66,6 +72,12 @@ interface BillingHistoryItem {
   status: 'completed' | 'failed' | 'refunded';
   paddleTransactionId: string;
   createdAt: string;
+}
+
+interface BillingSubscriptionChangeResponse {
+  changeTiming: 'immediate' | 'next_billing_period' | 'none';
+  effectiveAt?: string | null;
+  message: string;
 }
 
 const paddleEnvironment =
@@ -127,6 +139,34 @@ export default function BillingPage() {
       popupTimerRef.current = null;
     }, 3500);
   }, []);
+
+  const formatDateLabel = (value?: string | null) => {
+    if (!value) {
+      return null;
+    }
+
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+      return null;
+    }
+
+    return parsed.toLocaleDateString();
+  };
+
+  const formatPlanLabel = (plan?: Plan | null, billingCycle?: BillingCycle | null) => {
+    if (!plan) {
+      return null;
+    }
+
+    if (!billingCycle) {
+      return plan.name;
+    }
+
+    return t('planWithCycle', {
+      plan: plan.name,
+      cycle: billingCycle === 'annual' ? t('annual') : t('monthly'),
+    });
+  };
 
   useEffect(() => {
     dispatch(fetchBillingPageData());
@@ -210,8 +250,8 @@ export default function BillingPage() {
     !!currentSubscription &&
     currentSubscription.status !== 'active' &&
     (currentSubscription.status === 'trialing' || currentSubscription.isTrialing || currentSubscription.isTrial);
-  const autoPayEnabled = snapshot?.subscription?.status === 'active' && snapshot.subscription.paddleManaged;
-  const isPaddleActive = snapshot?.subscription?.status === 'active' && snapshot?.subscription?.paddleManaged;
+  const autoPayEnabled = currentSubscription?.status === 'active' && !!currentSubscription.paddleManaged;
+  const isPaddleActive = currentSubscription?.status === 'active' && !!currentSubscription?.paddleManaged;
   const cancelEffectiveDate = snapshot?.subscription?.cancelDate
     ? new Date(snapshot.subscription.cancelDate)
     : null;
@@ -224,6 +264,14 @@ export default function BillingPage() {
   const scheduledCancelDaysLeft = isCancelScheduled && cancelEffectiveDate
     ? Math.max(0, Math.ceil((cancelEffectiveDate.getTime() - Date.now()) / (24 * 60 * 60 * 1000)))
     : null;
+  const autoRenewEnabled = currentSubscription?.autoRenewEnabled
+    ?? (currentSubscription?.status === 'active' && currentSubscription?.paddleManaged ? !isCancelScheduled : false);
+  const hasScheduledPlanChange = currentSubscription?.hasScheduledPlanChange === true;
+  const nextRenewalPlan = autoRenewEnabled ? (currentSubscription?.nextPlan ?? snapshot?.plan ?? null) : null;
+  const nextRenewalCycle = autoRenewEnabled ? (currentSubscription?.nextBillingCycle ?? currentSubscription?.billingCycle ?? null) : null;
+  const nextRenewalPlanLabel = formatPlanLabel(nextRenewalPlan, nextRenewalCycle);
+  const nextBillingDateLabel = formatDateLabel(currentSubscription?.nextBillingDate);
+  const planChangeEffectiveLabel = formatDateLabel(currentSubscription?.planChangeEffectiveAt);
 
   const tierOrder: PlanTier[] = ['starter', 'pro', 'premium'];
   const currentTierIndex = currentTier ? tierOrder.indexOf(currentTier) : -1;
@@ -252,9 +300,38 @@ export default function BillingPage() {
     if (isPaddleActive) {
       setCheckoutError(null);
       try {
-        await dispatch(upgradeSubscription({ tier, billingCycle: cycle })).unwrap();
-        const planName = plans.find((plan) => plan.tier === tier)?.name || tier;
-        showPopup('success', `Your plan was updated to ${planName}.`);
+        const result = await dispatch(upgradeSubscription({ tier, billingCycle: cycle })).unwrap();
+        const updatedPlans = result.billingData.plans;
+        const updatedSubscription = result.billingData.snapshot?.subscription ?? null;
+        const fallbackPlan = updatedPlans.find((plan) => plan.tier === tier) ?? null;
+        const targetPlanLabel = formatPlanLabel(
+          updatedSubscription?.nextPlan ?? fallbackPlan,
+          updatedSubscription?.nextBillingCycle ?? cycle,
+        ) ?? fallbackPlan?.name ?? tier;
+        const effectiveDateLabel = formatDateLabel(
+          result.changeSummary.effectiveAt
+          ?? updatedSubscription?.planChangeEffectiveAt
+          ?? updatedSubscription?.nextBillingDate
+          ?? null,
+        );
+        const changeSummary = result.changeSummary as BillingSubscriptionChangeResponse;
+
+        if (changeSummary.changeTiming === 'next_billing_period') {
+          showPopup(
+            'success',
+            effectiveDateLabel
+              ? t('planChangeScheduled', { plan: targetPlanLabel, date: effectiveDateLabel })
+              : t('planChangeScheduledNoDate', { plan: targetPlanLabel }),
+          );
+          return;
+        }
+
+        if (changeSummary.changeTiming === 'none') {
+          showPopup('info', changeSummary.message || t('planChangeAlreadySet', { plan: targetPlanLabel }));
+          return;
+        }
+
+        showPopup('success', t('planChangeImmediate', { plan: targetPlanLabel }));
       } catch (err) {
         showPopup('error', getPaymentErrorMessage(err, 'Unable to change your plan right now.'));
       }
@@ -598,6 +675,17 @@ export default function BillingPage() {
             {hasEffectivePlan && snapshot?.alertsRemaining != null && (
               <p className="mt-1 text-xs text-gray-500">
                 {snapshot.alertsRemaining === -1 ? t('unlimitedAlerts') : t('alertsRemaining', { count: snapshot.alertsRemaining })}
+              </p>
+            )}
+            {hasEffectivePlan && autoRenewEnabled && nextRenewalPlanLabel && (
+              <p className={`mt-1 text-xs ${hasScheduledPlanChange ? 'text-amber-700' : 'text-gray-500'}`}>
+                {hasScheduledPlanChange
+                  ? planChangeEffectiveLabel
+                    ? t('scheduledRenewalPlan', { plan: nextRenewalPlanLabel, date: planChangeEffectiveLabel })
+                    : t('scheduledRenewalPlanNoDate', { plan: nextRenewalPlanLabel })
+                  : nextBillingDateLabel
+                    ? t('renewalPlan', { plan: nextRenewalPlanLabel, date: nextBillingDateLabel })
+                    : t('renewalPlanNoDate', { plan: nextRenewalPlanLabel })}
               </p>
             )}
 
