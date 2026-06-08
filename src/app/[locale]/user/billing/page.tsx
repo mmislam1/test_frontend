@@ -240,7 +240,8 @@ export default function BillingPage() {
   const currentSubscription = snapshot?.subscription ?? null;
   const hasEffectivePlan =
     !!currentSubscription &&
-    (currentSubscription.hasAccess === true || ['active', 'trialing', 'past_due'].includes(currentSubscription.status));
+    (currentSubscription.hasAccess === true ||
+      (currentSubscription.status != null && ['active', 'trialing', 'past_due'].includes(currentSubscription.status)));
   const currentTier: PlanTier | null = hasEffectivePlan ? (snapshot?.plan?.tier ?? null) : null;
   const currentPlanName = hasEffectivePlan ? (snapshot?.plan?.name ?? '--') : '--';
   // Paid active status MUST take priority over trial flags.
